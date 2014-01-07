@@ -1,0 +1,386 @@
+<?php
+define('NODEJS_CONTENT_LOCK_PENDING_DURATION', variable_get('nodejs_content_lock_pending_duration', 3));
+
+/**
+ * Implements hook_menu().
+ */
+function nodejs_content_lock_menu() {
+  $items['admin/content/nodejs_content_lock_check'] = array(
+    'page callback' => 'nodejs_content_lock_check',
+    'page arguments' => array(3),
+    'access arguments' => array('check out documents'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+* Implements hook_nodejs_handlers_info().
+*/
+function nodejs_content_lock_nodejs_handlers_info() {
+  $is_node_page = (arg(0) == 'node' && is_numeric(arg(1))) ? TRUE : FALSE;
+  $is_node_edit_page = ($is_node_page && arg(2) == 'edit') ? TRUE : FALSE;
+  $settings = array(
+    'url' => '/admin/content/nodejs_content_lock_check',
+    'isNodePage' => (int) $is_node_page,
+    'isNodeEditPage' => (int) $is_node_edit_page,
+  );
+  drupal_add_js(array('nodejsContentLock' => $settings), array('type' => 'setting'));
+  return array(
+    drupal_get_path('module', 'nodejs_content_lock') . '/nodejs_content_lock.js',
+  );
+}
+
+
+/**
+ * Checks Node.js server status.
+ *
+ * @return
+ *   TRUE if Node.js server is up; FALSE otherwise.
+ */
+function nodejs_content_lock_nodejs_get_status() {
+  $status = FALSE;
+  $nodejs_started = variable_get('nodejs_content_lock_nodejs_started', 0);
+  if ($nodejs_started) {
+    $status = TRUE;
+  }
+  return $status;
+}
+
+/**
+ * Implements hook_content_lock_locked().
+ * Respond to a lock being successfully set.
+ *
+ * Adds channel if it does not exist.
+ * Removes channel users if any.
+ * Adds user to channel.
+ * Removes pending timestamp if it exists.
+ */
+function nodejs_content_lock_content_lock_locked($nid, $uid) {
+  if (!nodejs_content_lock_nodejs_get_status()) {
+    return FALSE;
+  }
+  $channel_name = nodejs_content_lock_get_channel_name($nid);
+  $channel_exists = nodejs_get_check_channel($channel_name);
+  if ($channel_exists) {
+    nodejs_content_lock_remove_channel_users($channel_name);
+  }
+  else {
+    nodejs_get_add_channel($channel_name);
+  }
+  nodejs_add_user_to_channel($uid, $channel_name);
+  nodejs_content_lock_remove_pending($nid);
+}
+
+/**
+ * Implements hook_content_lock_release().
+ * Respond to a node's lock being released.
+ *
+ * Removes channel users if any.
+ * Removes channel.
+ * 
+ * @param $nid
+ *   Node ID whose lock was released.
+ */
+function nodejs_content_lock_content_lock_release($nid) {
+  if (!nodejs_content_lock_nodejs_get_status()) {
+    return FALSE;
+  }
+  $channel_name = nodejs_content_lock_get_channel_name($nid);
+  $channel_exists = nodejs_get_check_channel($channel_name);
+  if ($channel_exists) {
+    nodejs_content_lock_remove_channel_users($channel_name);
+    nodejs_get_remove_channel($channel_name);
+  }
+}
+
+/**
+ * Implements hook_nodejs_checker_alter().
+ * Sets the timestamp when nodejs server was started.
+ *
+ * @param $state
+ *   A boolean indicating the state of nodejs server.
+ */
+function nodejs_content_lock_nodejs_checker_alter($state) {
+  if ($state) {
+    variable_set('nodejs_content_lock_nodejs_started', REQUEST_TIME);
+  }
+  else {
+    variable_set('nodejs_content_lock_nodejs_started', 0);
+  }
+}
+
+/**
+ * Implements hook_nodejs_message_response_alter().
+ * 
+ * Removes nodejs_cotent_lock without releasing the content_lock
+ *
+ * @param $response
+ *   Response from Node.js server
+ */
+function nodejs_content_lock_nodejs_message_response_alter(&$response, &$message) {
+  switch ($message['messageType']) {
+    case 'userOffline':
+      nodejs_content_lock_unlock_by_uid($message['uid'], FALSE);
+      break;
+  }
+}
+
+/**
+ * Ajax menu callback for node lock confirmation.
+ * Removes pending timestamp.
+ */
+function nodejs_content_lock_check() {
+  $nid = !empty($_GET['nid']) ? $_GET['nid'] : NULL;
+  $uid = !empty($_GET['uid']) ? $_GET['uid'] : NULL;
+  $response['pending'] = 1;
+  if ($nid && $uid) {
+    nodejs_content_lock_remove_pending($nid);
+    $response['pending'] = 0;
+  }
+  drupal_json_output($response);
+  drupal_exit();
+}
+
+/**
+ * Implements hook_content_lock_skip_locking().
+ * Skips locking if pending duration exceeds N seconds.
+ * Sends notification message to lock owner.
+ * Sets lock pending timestamp and requests lock owner for lock confirmation.
+ *
+ * @return
+ *   TRUE if content lock should be skipped.
+ */
+function nodejs_content_lock_content_lock_skip_locking($node, $form_id, $form, $form_state) {
+  $ret_val = FALSE;
+  if ($node && ($form_id == $node->type . '_node_form' || $form_id == 'node_revision_revert_confirm')) {
+    global $user;
+    if (!nodejs_content_lock_nodejs_get_status()) {
+      return FALSE;
+    }
+    // release lock if lock pending duration is over
+    if (nodejs_content_lock_duration_is_over($node->nid)) {
+      nodejs_content_lock_unlock_by_nid($node->nid);
+      content_lock_node($node->nid, $user->uid);
+      $ret_val = TRUE;
+      drupal_set_message(t('Stale lock has been released.'));
+    }
+    $lock = content_lock_fetch_lock($node->nid);
+    if ($lock != FALSE) {
+      // do not continue if lock was created before nodejs server was started
+      if ($lock->timestamp < variable_get('nodejs_content_lock_nodejs_started', 0)) {
+        return FALSE;
+      }
+      $channel_name = nodejs_content_lock_get_channel_name($node->nid);
+      $channel_users = nodejs_get_content_channel_users($channel_name);
+      if (empty($channel_users['uids'])) {
+        nodejs_add_user_to_channel($lock->uid, $channel_name);
+      }
+      // if user is attempting to edit the node locked by another user
+      if ($lock->uid != $user->uid) {
+        $subject = '';
+        $username = $user->name;
+        $body = 'User ' . $username . ' attempted to edit node ' . $node->nid . ' (' . $node->title . ')';
+        drupal_alter('nodejs_content_lock_message_subject', $subject, $user->uid, $node->nid);
+        drupal_alter('nodejs_content_lock_message_body', $body, $user->uid, $node->nid);
+        
+        // notify owner of locked document about content edit attempt
+        nodejs_send_channel_message($channel_name, $subject, $body);
+        
+        // set lock as pending for confirmation
+        nodejs_content_lock_set_pending($node->nid);
+        
+        // request owner of locked document to confirm lock
+        nodejs_content_lock_request_lock_confirmation($node->nid, $lock->uid);
+
+        drupal_set_message(t('You may try to check if this document is locked by a stale lock and click !link. The stale lock will be released and you will be able to edit this document. (experimental).',
+          array('!link' => l('edit again', 'node/' . $node->nid . '/edit'))), 'warning');
+      }
+      else {
+        nodejs_content_lock_remove_pending($node->nid);
+      }
+    }
+  }
+  return $ret_val;
+}
+
+/**
+ * Sends lock confirmation message to nodejs channel.
+ *
+ * @param $nid
+ *   Node ID whose lock needs to be confirmed.
+ *
+ * @param $uid
+ *   User ID
+ */
+function nodejs_content_lock_request_lock_confirmation($nid, $uid) {
+  $channel_name = nodejs_content_lock_get_channel_name($nid);
+  $message = (object) array(
+    'data' => (object) array(
+      'nid' => $nid,
+      'uid' => $uid,
+    ),
+    'channel' => $channel_name,
+    'callback' => 'nodejsContentLockConfirmation',
+  );
+  nodejs_enqueue_message($message);
+}
+
+/**
+ * Unlocks lock by node ID.
+ * Removes channel users
+ * Removes channel
+ * Removes pending timestamp
+ *
+ * @param $nid
+ *   Node ID to be unlocked
+ *
+ * @param $release_lock
+ *   A boolean indicating whether content lock should be released.
+ */
+function nodejs_content_lock_unlock_by_nid($nid, $release_lock = TRUE) {
+  $channel_name = nodejs_content_lock_get_channel_name($nid);
+  $channel_exists = nodejs_get_check_channel($channel_name);
+  if ($channel_exists) {
+    nodejs_content_lock_remove_channel_users($channel_name);
+    nodejs_get_remove_channel($channel_name);
+  }
+  nodejs_content_lock_remove_pending($nid);
+  if ($release_lock) {
+    content_lock_release($nid);
+  }
+}
+
+/**
+ * Releases all locks by user ID.
+ * 
+ * @param $uid
+ *   User ID whose nodes should be unlocked.
+ *
+ * @param $release_lock
+ *   A boolean indicating whether content lock should be released.
+ */
+function nodejs_content_lock_unlock_by_uid($uid, $release_lock = TRUE) {
+  $query = db_select('content_lock', 'c')
+    ->fields('c', array('nid'))
+    ->condition('c.uid', $uid);
+  $result = $query->execute();
+  $nids = $result->fetchCol();
+  foreach ($nids as $nid) {
+    nodejs_content_lock_unlock_by_nid($nid, $release_lock);
+  }
+}
+
+/**
+ * Removes all users from channel.
+ *
+ * @param $channel_name
+ *   Node.js channel name.
+ *
+ * @param $exclude_uids
+ *   An array of user ID's which should not be removed from the channel.
+ */
+function nodejs_content_lock_remove_channel_users($channel_name, $exclude_uids = array()) {
+  $channel_users = nodejs_get_content_channel_users($channel_name);
+  if (!empty($channel_users['uids']) && count($channel_users['uids'])) {
+    foreach ($channel_users['uids'] as $uid) {
+      if (!in_array($uid, $exclude_uids)) {
+        nodejs_remove_user_from_channel($uid, $channel_name);
+      }
+    }
+  }
+}
+
+/**
+ * Sets content lock pending timestamp.
+ *
+ * @param $nid
+ *   Node ID for which content lock pending timestamp should be set.
+ */
+function nodejs_content_lock_set_pending($nid) {
+  db_merge('nodejs_content_lock')
+    ->key(array('nid' => $nid))
+    ->fields(array(
+          'nid' => $nid,
+          'pending' => REQUEST_TIME,
+    ))
+    ->execute();
+}
+
+/**
+ * Removes content lock pending timestamp.
+ * 
+ * @param $nid
+ *   Node ID for which content lock pending timestamp should be removed.
+ */
+function nodejs_content_lock_remove_pending($nid) {
+  db_delete('nodejs_content_lock')
+    ->condition('nid', $nid)
+    ->execute();
+}
+
+/**
+ * Returns content lock pending timestamp.
+ *
+ * @param $nid
+ *   Node ID for which content lock pending timestamp should be returned.
+ *
+ * @return
+ *   The timestamp of when the lock pending status was created.
+ */
+function nodejs_content_lock_get_pending_timestamp($nid) {
+  $query = db_select('nodejs_content_lock', 'c')
+    ->fields('c', array('pending'))
+    ->condition('nid', $nid);
+  $result = $query->execute();
+  $timestamp = $result->fetchField();
+  return $timestamp;
+}
+
+/**
+ * Returns content lock pending duration time.
+ *
+ * @param $nid
+ *   Node ID for which content lock pending duration time should be returned.
+ *
+ * @return
+ *   Pending duration in seconds.
+ */
+function nodejs_content_lock_get_pending_duration($nid) {
+  $pending_timestamp = nodejs_content_lock_get_pending_timestamp($nid);
+  $duration = $pending_timestamp ? time() - $pending_timestamp : 0;
+  return $duration;
+}
+
+/**
+ * Checks if pending duration exceeds N seconds.
+ *
+ * @param $nid
+ *   Node ID for which content lock pending duration is checked.
+ *
+ * @return
+ *   TRUE if duration exceeds N seconds; FALSE otherwise.
+ */
+function nodejs_content_lock_duration_is_over($nid) {
+  $is_over = FALSE;
+  $duration = nodejs_content_lock_get_pending_duration($nid);
+  if ($duration >= NODEJS_CONTENT_LOCK_PENDING_DURATION) {
+    $is_over = TRUE;
+  }
+  return $is_over;
+}
+
+/**
+ * Builds and returns lock Node.js channel name;
+ *
+ * @param $nid
+ *   Node ID for building channel name.
+ *
+ * @return
+ *   Channel name.
+ */
+function nodejs_content_lock_get_channel_name($nid) {
+  $channel_name = 'lock_' . $nid;
+  return $channel_name;
+}

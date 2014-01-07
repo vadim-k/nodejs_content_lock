@@ -1,0 +1,34 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the nodejs lock module.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function nodejs_content_lock_schema() {
+  return array(
+    'nodejs_content_lock' => array(
+      'description' => 'List of pending locks.',
+      'fields' => array(
+        'nid' => array(
+          'description' => 'The nid of the node.',
+          'type' => 'int',
+          'unsigned' => TRUE,
+          'not null' => TRUE,
+          'default' => 0,
+        ),
+        'pending' => array(
+          'description' => 'The timestamp of when the lock pending status was created.',
+          'type' => 'int',
+          'unsigned' => TRUE,
+          'not null' => TRUE,
+          'default' => 0,
+        ),
+      ),
+      'primary key' => array('nid'),
+    ),
+  );
+}

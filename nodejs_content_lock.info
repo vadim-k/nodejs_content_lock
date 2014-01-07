@@ -1,0 +1,9 @@
+name = Nodejs content lock
+description = "Prevents multiple users from trying to edit a single node simultaneously to prevent edit conflicts."
+package = Nodejs
+version = VERSION
+core = 7.x
+dependencies[] = content_lock
+dependencies[] = content_lock_timeout
+dependencies[] = nodejs
+dependencies[] = nodejs_checker
