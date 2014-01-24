@@ -1,6 +1,4 @@
 <?php
-define('NODEJS_CONTENT_LOCK_PENDING_DURATION', variable_get('nodejs_content_lock_pending_duration', 3));
-
 /**
  * Implements hook_menu().
  */
@@ -365,7 +363,7 @@ function nodejs_content_lock_get_pending_duration($nid) {
 function nodejs_content_lock_duration_is_over($nid) {
   $is_over = FALSE;
   $duration = nodejs_content_lock_get_pending_duration($nid);
-  if ($duration >= NODEJS_CONTENT_LOCK_PENDING_DURATION) {
+  if ($duration >= variable_get('nodejs_content_lock_pending_duration', 3)) {
     $is_over = TRUE;
   }
   return $is_over;
